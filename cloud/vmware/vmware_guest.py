@@ -72,7 +72,7 @@ options:
    nic:
         description:
             - A list of nics to add
-        required: True
+        required: False
    wait_for_ip_address:
         description:
             - Wait until vcenter detects an IP address for the guest
@@ -94,10 +94,13 @@ extends_documentation_fragment: vmware.documentation
 
 EXAMPLES = '''
 Example from Ansible playbook
+#
+# Crate VM from template
+#
     - name: create the VM
       vmware_guest:
         validate_certs: False
-        hostname: 192.168.1.209
+        hostname: 192.0.2.44
         username: administrator@vsphere.local
         password: vmware
         name: testvm_2
@@ -117,10 +120,23 @@ Example from Ansible playbook
             osid: centos64guest
             scsi: paravirtual
         datacenter: datacenter1
-        esxi_hostname: 192.168.1.117
+        esxi_hostname: 192.0.2.117
         template: template_el7
         wait_for_ip_address: yes
       register: deploy
+
+#
+# Gather facts only
+#
+    - name: gather the VM facts
+      vmware_guest:
+        validate_certs: False
+        hostname: 192.168.1.209
+        username: administrator@vsphere.local
+        password: vmware
+        name: testvm_2
+        esxi_hostname: 192.168.1.117
+      register: facts
 '''
 
 RETURN = """
@@ -140,14 +156,12 @@ HAS_PYVMOMI = False
 try:
     import pyVmomi
     from pyVmomi import vim
-    from pyVim.connect import SmartConnect, Disconnect
     HAS_PYVMOMI = True
 except ImportError:
     pass
 
-import atexit
 import os
-import ssl
+import string
 import time
 
 from ansible.module_utils.urls import fetch_url
@@ -164,31 +178,17 @@ class PyVmomiHelper(object):
         self.si = None
         self.smartconnect()
         self.datacenter = None
+        self.folders = None
+        self.foldermap = None
 
     def smartconnect(self):
-        kwargs = {'host': self.params['hostname'],
-                  'user': self.params['username'],
-                  'pwd': self.params['password']}
-
-        if hasattr(ssl, 'SSLContext'):
-            context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
-            context.verify_mode = ssl.CERT_NONE
-            kwargs['sslContext'] = context
-
-        # CONNECT TO THE SERVER
-        try:
-            self.si = SmartConnect(**kwargs)
-        except Exception:
-            err = get_exception()
-            self.module.fail_json(msg="Cannot connect to %s: %s" %
-                             (kwargs['host'], err))
-        atexit.register(Disconnect, self.si)
-        self.content = self.si.RetrieveContent()
+        self.content = connect_to_api(self.module)
 
     def _build_folder_tree(self, folder, tree={}, treepath=None):
 
         tree = {'virtualmachines': [],
                         'subfolders': {},
+                        'vimobj': folder,
                         'name': folder.name}
 
         children = None
@@ -200,7 +200,6 @@ class PyVmomiHelper(object):
                 if child == folder or child in tree:
                     continue
                 if type(child) == vim.Folder:
-                    #ctree = self._build_folder_tree(child, tree={})
                     ctree = self._build_folder_tree(child)
                     tree['subfolders'][child] = dict.copy(ctree)
                 elif type(child) == vim.VirtualMachine:
@@ -230,9 +229,31 @@ class PyVmomiHelper(object):
         else:
             thispath = os.path.join(inpath, folder['name'])
 
+        if thispath not in vmap['paths']:
+            vmap['paths'][thispath] = []
+
+        # helpful for isolating folder objects later on
+        if not 'path_by_fvim' in vmap:
+            vmap['path_by_fvim'] = {}
+        if not 'fvim_by_path' in vmap:
+            vmap['fvim_by_path'] = {}
+        # store object by path and store path by object
+        vmap['fvim_by_path'][thispath] = folder['vimobj']
+        vmap['path_by_fvim'][folder['vimobj']] = thispath
+
+        # helpful for isolating vm objects later on
+        if not 'path_by_vvim' in vmap:
+            vmap['path_by_vvim'] = {}
+        if not 'vvim_by_path' in vmap:
+            vmap['vvim_by_path'] = {}
+        if thispath not in vmap['vvim_by_path']:
+            vmap['vvim_by_path'][thispath] = []
+    
+
         for item in folder.items():
             k = item[0]
             v = item[1]
+
             if k == 'name':
                 pass
             elif k == 'subfolders':
@@ -244,21 +265,25 @@ class PyVmomiHelper(object):
                         vmap['names'][x.config.name] = []
                     vmap['names'][x.config.name].append(x.config.uuid)
                     vmap['uuids'][x.config.uuid] = x.config.name
-                    if not thispath in vmap['paths']:
-                        vmap['paths'][thispath] = []
                     vmap['paths'][thispath].append(x.config.uuid)
 
+                    if x not in vmap['vvim_by_path'][thispath]:
+                        vmap['vvim_by_path'][thispath].append(x)
+                    if x not in vmap['path_by_vvim']:
+                        vmap['path_by_vvim'][x] = thispath
         return vmap
 
     def getfolders(self):
 
         if not self.datacenter:
-            self.datacenter = get_obj(self.content, [vim.Datacenter], 
-                                       self.params['esxi']['datacenter'])
+            self.get_datacenter()
         self.folders = self._build_folder_tree(self.datacenter.vmFolder)
         self.folder_map = self._build_folder_map(self.folders)
         return (self.folders, self.folder_map)
 
+    def get_datacenter(self):
+        self.datacenter = get_obj(self.content, [vim.Datacenter], 
+                                   self.params['datacenter'])
 
     def getvm(self, name=None, uuid=None, folder=None, name_match=None):
 
@@ -269,40 +294,47 @@ class PyVmomiHelper(object):
         folder_path = None
 
         if uuid:
-            vm = self.si.content.searchIndex.FindByUuid(uuid=uuid, vmSearch=True)
+            vm = self.content.searchIndex.FindByUuid(uuid=uuid, vmSearch=True)
 
         elif folder:
 
-            matches = []
-            folder_paths = []
+            if self.params['folder'].endswith('/'):
+                self.params['folder'] = self.params['folder'][0:-1]
 
-            datacenter = None
-            if 'esxi' in self.params:
-                if 'datacenter' in self.params['esxi']:
-                    datacenter = self.params['esxi']['datacenter']
-
-            if datacenter:
-                folder_paths.append('%s/vm/%s' % (datacenter, folder))
+            # Build the absolute folder path to pass into the search method
+            searchpath = None
+            if self.params['folder'].startswith('/vm'):
+                searchpath = '%s' % self.params['datacenter']
+                searchpath += self.params['folder']
+            elif self.params['folder'].startswith('/'):
+                searchpath = '%s' % self.params['datacenter']
+                searchpath += '/vm' + self.params['folder']
             else:
-                # get a list of datacenters
-                datacenters = get_all_objs(self.content, [vim.Datacenter])
-                datacenters = [x.name for x in datacenters]
-                for dc in datacenters:
-                    folder_paths.append('%s/vm/%s' % (dc, folder))
+                # need to look for matching absolute path
+                if not self.folders:
+                    self.getfolders()
+                paths = self.folder_map['paths'].keys()
+                paths = [x for x in paths if x.endswith(self.params['folder'])]
+                if len(paths) > 1:
+                    self.module.fail_json(msg='%s matches more than one folder. Please use the absolute path starting with /vm/' % self.params['folder'])
+                elif paths:
+                    searchpath = paths[0]
 
-            for folder_path in folder_paths:
-                fObj = self.si.content.searchIndex.FindByInventoryPath(folder_path)
-                for cObj in fObj.childEntity:
-                    if not type(cObj) == vim.VirtualMachine:
-                        continue
-                    if cObj.name == name:
-                        matches.append(cObj)
-            if len(matches) > 1 and not name_match:
-                module.fail_json(msg='more than 1 vm exists by the name %s in folder %s. Please specify a uuid, a datacenter or name_match' \
-                                 % (folder, name))
-            elif len(matches) > 0:
-                vm = matches[0]
+            if searchpath:
+                # get all objects for this path ...
+                fObj = self.content.searchIndex.FindByInventoryPath(searchpath)
+                if fObj:
+                    if isinstance(fObj, vim.Datacenter):
+                        fObj = fObj.vmFolder
+                    for cObj in fObj.childEntity:
+                        if not type(cObj) == vim.VirtualMachine:
+                            continue
+                        if cObj.name == name:
+                            vm = cObj
+                            break
+
         else:
+            # FIXME - this is unused if folder has a default value
             vmList = get_all_objs(self.content, [vim.VirtualMachine])
             if name_match:
                 if name_match == 'first':
@@ -445,54 +477,153 @@ class PyVmomiHelper(object):
     def deploy_template(self, poweron=False, wait_for_ip=False):
 
         # https://github.com/vmware/pyvmomi-community-samples/blob/master/samples/clone_vm.py
+        # https://www.vmware.com/support/developer/vc-sdk/visdk25pubs/ReferenceGuide/vim.vm.CloneSpec.html
+        # https://www.vmware.com/support/developer/vc-sdk/visdk25pubs/ReferenceGuide/vim.vm.ConfigSpec.html
+        # https://www.vmware.com/support/developer/vc-sdk/visdk41pubs/ApiReference/vim.vm.RelocateSpec.html
 
         # FIXME:
         #   - clusters
         #   - multiple datacenters
         #   - resource pools
         #   - multiple templates by the same name
+        #   - multiple disks
+        #   - changing the esx host is ignored?
         #   - static IPs
+
+        # FIXME: need to search for this in the same way as guests to ensure accuracy
+        template = get_obj(self.content, [vim.VirtualMachine], self.params['template'])
+        if not template:
+            self.module.fail_json(msg="Could not find a template named %s" % self.params['template'])
 
         datacenters = get_all_objs(self.content, [vim.Datacenter])
         datacenter = get_obj(self.content, [vim.Datacenter], 
                              self.params['datacenter'])
+        if not datacenter:
+            self.module.fail_json(msg='No datacenter named %s was found' % self.params['datacenter'])
 
-        # folder is a required clone argument
-        if len(datacenters) > 1:
-            # FIXME: need to find the folder in the right DC.
-            raise "multi-dc with folders is not yet implemented"
-        else:    
-            destfolder = get_obj(
-                            self.content, 
-                            [vim.Folder], 
-                            self.params['folder']
-                         )
+        if not self.foldermap:
+            self.folders, self.foldermap = self.getfolders()
 
-        datastore_name = self.params['disk'][0]['datastore']
-        datastore = get_obj(self.content, [vim.Datastore], datastore_name)
+        # find matching folders
+        if self.params['folder'].startswith('/'):
+            folders = [x for x in self.foldermap['fvim_by_path'].items() if x[0] == self.params['folder']]
+        else:
+            folders = [x for x in self.foldermap['fvim_by_path'].items() if x[0].endswith(self.params['folder'])]
 
+        # throw error if more than one match or no matches
+        if len(folders) == 0:
+            self.module.fail_json(msg='no folder matched the path: %s' % self.params['folder'])
+        elif len(folders) > 1:
+            self.module.fail_json(msg='too many folders matched "%s", please give the full path starting with /vm/' % self.params['folder'])
 
-        # cluster or hostsystem ... ?
+        # grab the folder vim object
+        destfolder = folders[0][1]
+
+        # FIXME: cluster or hostsystem ... ?
         #cluster = get_obj(self.content, [vim.ClusterComputeResource], self.params['esxi']['hostname'])
         hostsystem = get_obj(self.content, [vim.HostSystem], self.params['esxi_hostname'])
 
-        resource_pools = get_all_objs(self.content, [vim.ResourcePool])
+        # set the destination datastore in the relocation spec
+        datastore_name = None
+        datastore = None
+        if self.params['disk']:
+            if 'datastore' in self.params['disk'][0]:
+                datastore_name = self.params['disk'][0]['datastore']
+                datastore = get_obj(self.content, [vim.Datastore], datastore_name)
+        if not datastore:
+            # use the template's existing DS
+            disks = [x for x in template.config.hardware.device if isinstance(x, vim.vm.device.VirtualDisk)]
+            datastore = disks[0].backing.datastore
+            datastore_name = datastore.name
+        if not datastore:
+            self.module.fail_json(msg="Failed to find a matching datastore")
 
+        # create the relocation spec
         relospec = vim.vm.RelocateSpec()
+        relospec.host = hostsystem
         relospec.datastore = datastore
 
-        # fixme ... use the pool from the cluster if given
-        relospec.pool = resource_pools[0]
-        relospec.host = hostsystem
+        # Find the associated resourcepool for the host system
+        #   * FIXME: find resourcepool for clusters too
+        resource_pool = None
+        resource_pools = get_all_objs(self.content, [vim.ResourcePool])
+        for rp in resource_pools.items():
+            if rp[0].parent == hostsystem.parent:
+                resource_pool = rp[0]    
+                break
+        if resource_pool:
+            relospec.pool = resource_pool
+        else:
+            self.module.fail_json(msg="Failed to find a resource group for %s" \
+                                  % hostsystem.name)
 
-        clonespec = vim.vm.CloneSpec()
-        clonespec.location = relospec
+        clonespec_kwargs = {}
+        clonespec_kwargs['location'] = relospec
 
-        template = get_obj(self.content, [vim.VirtualMachine], self.params['template'])
+        # create disk spec if not default
+        if self.params['disk']:
+            # grab the template's first disk and modify it for this customization
+            disks = [x for x in template.config.hardware.device if isinstance(x, vim.vm.device.VirtualDisk)]
+            diskspec = vim.vm.device.VirtualDeviceSpec()
+            # set the operation to edit so that it knows to keep other settings
+            diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+            diskspec.device = disks[0]
+
+            # get the first disk attributes
+            pspec = self.params.get('disk')[0]
+
+            # is it thin?
+            if pspec.get('type', '').lower() == 'thin':
+                diskspec.device.backing.thinProvisioned = True
+
+            # which datastore?
+            if pspec.get('datastore'):
+                # This is already handled by the relocation spec,
+                # but it needs to eventually be handled for all the
+                # other disks defined
+                pass
+
+            # what size is it?
+            if [x for x in pspec.keys() if x.startswith('size_') or x == 'size']:
+                # size_tb, size_gb, size_mb, size_kb, size_b ...?
+                if 'size' in pspec:
+                    # http://stackoverflow.com/a/1451407
+                    trans = string.maketrans('', '')
+                    chars = trans.translate(trans, string.digits)
+                    expected = pspec['size'].translate(trans, chars)
+                    expected = expected
+                    unit = pspec['size'].replace(expected, '').lower()
+                    expected = int(expected)
+                else:
+                    param = [x for x in pspec.keys() if x.startswith('size_')][0]
+                    unit = param.split('_')[-1].lower()
+                    expected = [x[1] for x in pspec.items() if x[0].startswith('size_')][0]
+                    expected = int(expected)
+
+                kb = None
+                if unit == 'tb':
+                    kb = expected * 1024 * 1024 * 1024
+                elif unit == 'gb':
+                    kb = expected * 1024 * 1024
+                elif unit ==' mb':
+                    kb = expected * 1024
+                elif unit == 'kb':
+                    kb = expected
+                else:
+                    self.module.fail_json(msg='%s is not a supported unit for disk size' % unit)
+                diskspec.device.capacityInKB = kb
+
+            # tell the configspec that the disk device needs to change
+            configspec = vim.vm.ConfigSpec(deviceChange=[diskspec])
+            clonespec_kwargs['config'] = configspec
+
+        clonespec = vim.vm.CloneSpec(**clonespec_kwargs)
         task = template.Clone(folder=destfolder, name=self.params['name'], spec=clonespec)
         self.wait_for_task(task)
 
         if task.info.state == 'error':
+            # https://kb.vmware.com/selfservice/microsites/search.do?language=en_US&cmd=displayKC&externalId=2021361
+            # https://kb.vmware.com/selfservice/microsites/search.do?language=en_US&cmd=displayKC&externalId=2173
             return ({'changed': False, 'failed': True, 'msg': task.info.error.msg})
         else:
 
@@ -524,7 +655,6 @@ class PyVmomiHelper(object):
                 time.sleep(sleep)
                 thispoll += 1
 
-        #import epdb; epdb.st()
         return facts
 
 
@@ -684,7 +814,6 @@ class PyVmomiHelper(object):
 
         return result
 
-
 def get_obj(content, vimtype, name):
     """
     Return an object by name, if name is None the
@@ -704,60 +833,6 @@ def get_obj(content, vimtype, name):
 
     container.Destroy()
     return obj
-
-
-def get_all_objs(content, vimtype):
-    """
-    Get all the vsphere objects associated with a given type
-    """
-    obj = []
-    container = content.viewManager.CreateContainerView(content.rootFolder, vimtype, True)
-    for c in container.view:
-        obj.append(c)
-    container.Destroy()
-    return obj
-
-
-def _build_folder_tree(nodes, parent):
-    tree = {}
-
-    for node in nodes:
-        if node['parent'] == parent:
-            tree[node['name']] = dict.copy(node)
-            tree[node['name']]['subfolders'] = _build_folder_tree(nodes, node['id'])
-            del tree[node['name']]['parent']
-
-    return tree
-
-
-def _find_path_in_tree(tree, path):
-    for name, o in tree.iteritems():
-        if name == path[0]:
-            if len(path) == 1:
-                return o
-            else:
-                return _find_path_in_tree(o['subfolders'], path[1:])
-
-    return None
-
-
-def _get_folderid_for_path(vsphere_client, datacenter, path):
-    content = vsphere_client._retrieve_properties_traversal(property_names=['name', 'parent'], obj_type=MORTypes.Folder)
-    if not content: return {}
-
-    node_list = [
-        {
-            'id': o.Obj,
-            'name': o.PropSet[0].Val,
-            'parent': (o.PropSet[1].Val if len(o.PropSet) > 1 else None)
-        } for o in content
-    ]
-
-    tree = _build_folder_tree(node_list, datacenter)
-    tree = _find_path_in_tree(tree, ['vm'])['subfolders']
-    folder = _find_path_in_tree(tree, path.split('/'))
-    return folder['id'] if folder else None
-
 
 
 def main():
@@ -794,9 +869,9 @@ def main():
             name=dict(required=True, type='str'),
             name_match=dict(required=False, type='str', default='first'),
             uuid=dict(required=False, type='str'),
-            folder=dict(required=False, type='str', default=None, aliases=['folder']),
-            disk=dict(required=True, type='list'),
-            nic=dict(required=True, type='list'),
+            folder=dict(required=False, type='str', default='/vm', aliases=['folder']),
+            disk=dict(required=False, type='list'),
+            nic=dict(required=False, type='list'),
             hardware=dict(required=False, type='dict', default={}),
             force=dict(required=False, type='bool', default=False),
             datacenter=dict(required=False, type='str', default=None),
@@ -850,6 +925,7 @@ def main():
                         poweron=poweron, 
                         wait_for_ip=module.params['wait_for_ip_address']
                      )
+            result['changed'] = True
         elif module.params['state'] == 'absent':
             result = {'changed': False, 'failed': False}
         else:
@@ -865,7 +941,7 @@ def main():
         module.exit_json(**result)
 
 
-# this is magic, see lib/ansible/module_common.py
+from ansible.module_utils.vmware import *
 from ansible.module_utils.basic import *
 
 if __name__ == '__main__':
